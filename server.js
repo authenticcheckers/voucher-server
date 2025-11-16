@@ -1,3 +1,6 @@
+app.get("/", (req, res) => {
+  res.send("Voucher server is running ✔");
+});
 
 const express = require('express');
 const bodyParser = require('body-parser');
