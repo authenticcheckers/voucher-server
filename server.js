@@ -1,3 +1,11 @@
+const cors = require("cors");
+
+app.use(cors({
+  origin: "https://authenticcheckers.github.io",
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
 // server.js
 // ✔ Paystack initialize
 // ✔ Paystack webhook (with signature verification)
