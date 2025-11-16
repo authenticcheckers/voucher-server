@@ -219,3 +219,103 @@ app.post('/webhook', async (req, res) => {
 app.get('/', (req, res) => res.send('Voucher server running ✔'));
 
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+app.post('/create-payment', async (req, res) => {
+  const { name, phone } = req.body;
+
+  if (!name || !phone) {
+    return res.status(400).json({ error: "Name and phone required" });
+  }
+
+  try {
+    const response = await axios.post(
+      "https://api.paystack.co/transaction/initialize",
+      {
+        email: `${phone}@autovoucher.com`,
+        amount: 2500 * 100, // 25 cedis
+        metadata: { name, phone }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    return res.json({
+      authorization_url: response.data.data.authorization_url
+    });
+
+  } catch (error) {
+    console.error(error.response?.data || error);
+    return res.status(500).json({ error: "Payment creation failed" });
+  }
+});
+app.post('/webhook', bodyParser.raw({ type: '*/*' }), async (req, res) => {
+  try {
+    const signature = req.headers['x-paystack-signature'];
+    const crypto = require("crypto");
+
+    const hash = crypto
+      .createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
+      .update(req.body)
+      .digest('hex');
+
+    if (hash !== signature) {
+      console.log("Signature mismatch");
+      return res.sendStatus(401);
+    }
+
+    const event = JSON.parse(req.body);
+
+    if (event.event === "charge.success") {
+      const { name, phone } = event.data.metadata;
+
+      console.log("Payment confirmed for:", name, phone);
+
+      // ==== 1. GET unused voucher from Google Sheet ====
+      await doc.loadInfo();
+      const sheet = doc.sheetsByIndex[0];
+      const rows = await sheet.getRows();
+
+      const unused = rows.find(r => r.Status !== "USED");
+
+      if (!unused) {
+        console.log("No vouchers left");
+        return res.sendStatus(200);
+      }
+
+      const voucherCode = unused.Code;
+
+      // Mark voucher as used
+      unused.Status = "USED";
+      await unused.save();
+
+      // ==== 2. SEND SMS VIA ARKESEL ====
+      await axios.post(
+        "https://sms.arkesel.com/api/v2/sms/send",
+        {
+          sender: "CHECKER",
+          message: `Your WASSCE voucher: ${voucherCode}`,
+          recipients: [phone]
+        },
+        {
+          headers: {
+            "api-key": process.env.ARKESEL_API_KEY
+          }
+        }
+      );
+
+      console.log("Voucher sent:", voucherCode);
+
+      return res.sendStatus(200);
+    }
+
+    res.sendStatus(200);
+
+  } catch (error) {
+    console.error(error);
+    res.sendStatus(500);
+  }
+});
+
