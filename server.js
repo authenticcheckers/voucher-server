@@ -31,15 +31,6 @@ const SHEET_ID = process.env.SHEET_ID || '';
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || '';
 
-// ======= ENV CONFIG =======
-const PORT = process.env.PORT || 3000;
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || '';
-const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET_KEY;
-const ARKESEL_API_KEY = process.env.ARKESEL_API_KEY || '';
-const ARKESEL_SENDER = process.env.ARKESEL_SENDER || '';
-const SHEET_ID = process.env.SHEET_ID || '';
-const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';
-const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || '';
 
 if (!PAYSTACK_SECRET_KEY) {
   console.error("Missing Paystack key.");
