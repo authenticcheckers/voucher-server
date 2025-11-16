@@ -1,18 +1,7 @@
-const cors = require("cors");
-
-app.use(cors({
-  origin: "https://authenticcheckers.github.io",
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
 // server.js
-// ✔ Paystack initialize
-// ✔ Paystack webhook (with signature verification)
-// ✔ Google Sheet voucher picking (Serial + Pin + Status)
-// ✔ Arkesel SMS sending
 
 const express = require('express');
+const cors = require("cors");
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -20,10 +9,27 @@ const { google } = require('googleapis');
 
 const app = express();
 
-// Needed for Paystack signature verification
+// ========= ENABLE CORS (AFTER app is created!) =========
+app.use(cors({
+  origin: "https://authenticcheckers.github.io",
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+// ========= RAW BODY FOR PAYSTACK SIGNATURE =========
 app.use(bodyParser.json({
   verify: (req, res, buf) => { req.rawBody = buf.toString(); }
 }));
+
+// ======= ENV CONFIG =======
+const PORT = process.env.PORT || 3000;
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || '';
+const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET_KEY;
+const ARKESEL_API_KEY = process.env.ARKESEL_API_KEY || '';
+const ARKESEL_SENDER = process.env.ARKESEL_SENDER || '';
+const SHEET_ID = process.env.SHEET_ID || '';
+const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';
+const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || '';
 
 // ======= ENV CONFIG =======
 const PORT = process.env.PORT || 3000;
