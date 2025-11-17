@@ -199,47 +199,95 @@ async function recordAffiliateSale(refCode, buyerPhone, amountGHS) {
 // =========================================================
 // =============== CREATE PAYMENT ROUTE ====================
 // =========================================================
-app.post('/create-payment', async (req, res) => {
+app.post("/create-payment", async (req, res) => {
   try {
     const { name, phone, email, ref } = req.body;
 
-    if (!name || !phone) return res.status(400).json({ error: "name and phone required" });
+    // ---- VALIDATION ----
+    if (!name || !phone || !email) {
+      return res.status(400).json({
+        success: false,
+        message: "Name, phone, and email are required."
+      });
+    }
 
-    // Normalize phone: 054... → 23354...
-    let fixedPhone = phone.trim();
-    if (fixedPhone.startsWith("0")) fixedPhone = "233" + fixedPhone.slice(1);
-    if (fixedPhone.startsWith("+")) fixedPhone = fixedPhone.slice(1);
+    // simple email format check
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid email format."
+      });
+    }
 
-    const amountGHS = 25.00;
-    const amountPesewas = Math.round(amountGHS * 100);
-
-    const response = await axios.post(
-      "https://api.paystack.co/transaction/initialize",
-      {
-        email: email || `${fixedPhone}@noemail.local`,
-        amount: amountPesewas,
-        currency: "GHS",
-        metadata: { name, phone: fixedPhone, ref: ref || null }
+    // ---- CREATE PAYSTACK PAYMENT ----
+    const paystackResp = await fetch("https://api.paystack.co/transaction/initialize", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET}`,
+        "Content-Type": "application/json"
       },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
+      body: JSON.stringify({
+        amount: 2500 * 100,   // GHS 25
+        email: email,         // REQUIRED!
+        metadata: {
+          name,
+          phone,
+          ref
+        },
+        callback_url: process.env.PAYSTACK_CALLBACK_URL
+      })
+    });
+
+    const data = await paystackResp.json();
+
+    if (!data.status) {
+      console.error("Paystack init error:", data);
+      return res.status(400).json({
+        success: false,
+        message: data.message || "Payment initialization failed."
+      });
+    }
+
+    // ---- LOG TO GOOGLE SHEETS ----
+
+    const sheet = doc.sheetsByTitle["Payments"];
+    await sheet.addRow({
+      Timestamp: new Date().toISOString(),
+      Name: name,
+      Email: email,
+      Phone: phone,
+      Referral: ref || "",
+      Amount: "25",
+      Status: "Initialized",
+      Paystack_Ref: data.data.reference
+    });
+
+    // ---- If referral exists, log it SEPARATELY ----
+    if (ref) {
+      const affSheet = doc.sheetsByTitle["Affiliate Logs"];
+      await affSheet.addRow({
+        Timestamp: new Date().toISOString(),
+        Affiliate_Code: ref,
+        Buyer_Name: name,
+        Buyer_Email: email,
+        Earnings: "3" // GHS 3 per voucher
+      });
+    }
 
     return res.json({
-      authorization_url: response.data.data.authorization_url,
-      reference: response.data.data.reference,
-      amount: amountGHS
+      authorization_url: data.data.authorization_url
     });
 
   } catch (err) {
-    console.error("create-payment error:", err.response?.data || err.message);
-    res.status(500).json({ error: "Payment creation failed" });
+    console.error("create-payment error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error. Try again."
+    });
   }
 });
+
 
 // =========================================================
 // ==================== WEBHOOK ROUTE ======================
