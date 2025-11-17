@@ -1,214 +1,314 @@
-// =================== CORS ==========================
+// server.js - Authentic Checkers backend
+// Requirements:
+// - Node 18+
+// - Environment variables configured (see below)
+// - Google Sheets with the tabs: main voucher sheet, "Affiliates", "AffiliateSales"
+
+// Environment variables used:
+// PAYSTACK_SECRET_KEY
+// PAYSTACK_WEBHOOK_SECRET (optional; defaults to PAYSTACK_SECRET_KEY)
+// ARKESEL_API_KEY
+// ARKESEL_SENDER (optional)
+// SHEET_ID
+// GOOGLE_CLIENT_EMAIL
+// GOOGLE_PRIVATE_KEY  (use actual newlines or use \\n in the value and code below replaces them)
+// PORT (optional)
+
+const express = require("express");
 const cors = require("cors");
+const bodyParser = require("body-parser");
+const crypto = require("crypto");
+const axios = require("axios");
+const { google } = require("googleapis");
+
+const app = express();
+
+// CORS - allow your frontend sources
 app.use(cors({
-  origin: "https://authenticcheckers.github.io",
+  origin: [
+    "https://authenticcheckers.github.io",
+    "https://sites.google.com",
+    "https://sites.google.com/view/wasscevouchershop",
+    "https://sites.google.com/view/wasscevouchershop/home"
+  ],
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
-// ================== IMPORTS ========================
-const express = require('express');
-const bodyParser = require('body-parser');
-const crypto = require('crypto');
-const axios = require('axios');
-const { google } = require('googleapis');
-
-const app = express();
-
-// Needed for Paystack signature verification
+// capture raw body for webhook verification
 app.use(bodyParser.json({
   verify: (req, res, buf) => { req.rawBody = buf.toString(); }
 }));
 
-// ================== ENV KEYS =======================
+// ========= ENV CONFIG =========
 const PORT = process.env.PORT || 3000;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || '';
 const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET_KEY;
-
 const ARKESEL_API_KEY = process.env.ARKESEL_API_KEY || '';
 const ARKESEL_SENDER = process.env.ARKESEL_SENDER || '';
-
 const SHEET_ID = process.env.SHEET_ID || '';
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';
-const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || '';
+let GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || '';
 
-if (!PAYSTACK_SECRET_KEY || !SHEET_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) {
-  console.error("Missing environment variables");
+if (!PAYSTACK_SECRET_KEY) {
+  console.error("Missing PAYSTACK_SECRET_KEY. Exiting.");
   process.exit(1);
 }
+if (!SHEET_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) {
+  console.error("Missing Google Sheets config (SHEET_ID / GOOGLE_CLIENT_EMAIL / GOOGLE_PRIVATE_KEY). Exiting.");
+  process.exit(1);
+}
+if (!ARKESEL_API_KEY) {
+  console.warn("ARKESEL_API_KEY not set — SMS will fail until provided.");
+}
 
-// =================== GOOGLE SHEETS =================
+// fix private key newlines if they were stored with \n
+GOOGLE_PRIVATE_KEY = GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
+
+// ======= Google Sheets client helper =======
 function getSheetsClient() {
-  const key = GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
+  const credentials = {
+    type: "service_account",
+    client_email: GOOGLE_CLIENT_EMAIL,
+    private_key: GOOGLE_PRIVATE_KEY
+  };
 
   const auth = new google.auth.GoogleAuth({
-    credentials: {
-      type: "service_account",
-      client_email: GOOGLE_CLIENT_EMAIL,
-      private_key: key
-    },
+    credentials,
     scopes: ['https://www.googleapis.com/auth/spreadsheets']
   });
 
   return google.sheets({ version: 'v4', auth });
 }
 
-// ============ PICK & MARK VOUCHER ==================
+// ======= pick first unused voucher, mark USED, return {serial,pin} =======
 async function getAndMarkVoucher(phone, email, refCode) {
   const sheets = getSheetsClient();
 
-  const read = await sheets.spreadsheets.values.get({
+  const readRes = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: "A2:G"
+    range: 'A2:F' // read from serial/pin/status area
   });
 
-  const rows = read.data.values || [];
-
-  // Find first unused row
+  const rows = readRes.data.values || [];
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
-    const status = (row[2] || "").toLowerCase();
-
-    if (status !== "used") {
-      const serial = row[0];
-      const pin = row[1];
-      const rowNumber = i + 2;
-      const timestamp = new Date().toISOString();
-
+    const used = (row[2] || '').toString().trim().toLowerCase();
+    if (used !== 'yes' && used !== 'used') {
+      const serial = (row[0] || '').toString().trim();
+      const pin = (row[1] || '').toString().trim();
+      const now = new Date().toISOString();
+      const rowIndex = i + 2;
+      // we will write serial,pin,USED,phone,email,date
       await sheets.spreadsheets.values.update({
         spreadsheetId: SHEET_ID,
-        range: `A${rowNumber}:G${rowNumber}`,
-        valueInputOption: "RAW",
+        range: `A${rowIndex}:F${rowIndex}`,
+        valueInputOption: 'RAW',
         requestBody: {
-          values: [[serial, pin, "USED", phone, email, timestamp, refCode || ""]]
+          values: [
+            [serial, pin, 'USED', phone || '', email || '', now]
+          ]
         }
       });
-
       return { serial, pin };
     }
   }
   return null;
 }
 
-// ===================== ARKESEL SMS ===================
-async function sendSMS(phone, message) {
+// ======= send SMS via Arkesel =======
+async function sendArkeselSMS(phone, message) {
+  const url = 'https://sms.arkesel.com/api/v2/sms/send';
   const payload = { recipients: [phone], message };
   if (ARKESEL_SENDER) payload.sender = ARKESEL_SENDER;
-
-  const resp = await axios.post(
-    "https://sms.arkesel.com/api/v2/sms/send",
-    payload,
-    { headers: { "api-key": ARKESEL_API_KEY } }
-  );
+  const headers = { 'Content-Type': 'application/json', 'api-key': ARKESEL_API_KEY };
+  const resp = await axios.post(url, payload, { headers });
   return resp.data;
 }
 
-// ================ PAYSTACK SIGNATURE ==================
-function verifySignature(rawBody, signature) {
-  const computed = crypto
-    .createHmac("sha512", PAYSTACK_WEBHOOK_SECRET)
-    .update(rawBody)
-    .digest("hex");
-  return computed === signature;
+// ======= verify Paystack webhook signature =======
+function verifyPaystackSignature(rawBody, signature) {
+  const secret = PAYSTACK_WEBHOOK_SECRET;
+  if (!secret) return false;
+  const hash = crypto.createHmac('sha512', secret).update(rawBody).digest('hex');
+  return hash === signature;
 }
 
-// ======================================================
-// =============== CREATE PAYMENT ROUTE =================
-// ======================================================
+// ======= AFFILIATE HELPERS =======
+const COMMISSION_GHS = 3;
+async function recordAffiliateSale(refCode, buyerPhone, voucherSerial) {
+  if (!refCode) return;
+  const sheets = getSheetsClient();
+  const now = new Date().toISOString();
+  const commission = COMMISSION_GHS;
+  // Append to AffiliateSales: Date | AffiliateCode | BuyerPhone | Amount | Commission | VoucherSerial | PaidStatus
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: 'AffiliateSales!A:G',
+    valueInputOption: 'RAW',
+    requestBody: {
+      values: [[now, refCode, buyerPhone, 25, commission, voucherSerial || '', 'no']]
+    }
+  });
+
+  // Update Affiliates: find AffiliateCode row and update totals, or append new row
+  const affRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: 'Affiliates!A2:E'
+  });
+  const affRows = affRes.data.values || [];
+
+  let foundIndex = -1;
+  for (let i = 0; i < affRows.length; i++) {
+    if ((affRows[i][0] || '').toString() === refCode) { foundIndex = i; break; }
+  }
+
+  if (foundIndex === -1) {
+    // Create new affiliate row: AffiliateCode, Name(empty), Phone(empty), TotalSales=1, TotalCommission=commission
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: 'Affiliates!A:E',
+      valueInputOption: 'RAW',
+      requestBody: {
+        values: [[refCode, '', '', 1, commission]]
+      }
+    });
+  } else {
+    const rowNum = foundIndex + 2;
+    const existing = affRows[foundIndex];
+    const prevSales = parseFloat(existing[3] || 0) || 0;
+    const prevComm = parseFloat(existing[4] || 0) || 0;
+    const newSales = prevSales + 1;
+    const newComm = prevComm + commission;
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `Affiliates!D${rowNum}:E${rowNum}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[newSales, newComm]] }
+    });
+  }
+}
+
+// ======= CREATE PAYMENT ROUTE =======
 app.post('/create-payment', async (req, res) => {
   try {
-    const { name, phone, email, ref } = req.body;
+    const { name, phone, email, ref } = req.body || {};
 
     if (!name || !phone || !email) {
-      return res.status(400).json({ error: "name, phone and email required" });
+      return res.status(400).json({ error: 'name, phone and email required' });
     }
 
-    // Normalize Ghana phone number
-    let fixedPhone = phone.trim();
-    if (fixedPhone.startsWith("0")) fixedPhone = "233" + fixedPhone.slice(1);
-    if (fixedPhone.startsWith("+")) fixedPhone = fixedPhone.slice(1);
+    // normalize phone to no '+' and Ghana format
+    let normalizedPhone = phone.toString().trim();
+    normalizedPhone = normalizedPhone.replace(/\s+/g, '');
+    if (normalizedPhone.startsWith('+')) normalizedPhone = normalizedPhone.slice(1);
+    if (normalizedPhone.startsWith('0')) normalizedPhone = '233' + normalizedPhone.slice(1);
 
-    // Amount
     const amountGHS = 25.00;
-    const amountPesewas = amountGHS * 100;
+    const amountSmallest = Math.round(amountGHS * 100);
 
-    const response = await axios.post(
-      "https://api.paystack.co/transaction/initialize",
-      {
-        email,
-        amount: amountPesewas,
-        currency: "GHS",
-        metadata: { name, phone: fixedPhone, email, refCode: ref || "" }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
+    const initResp = await axios.post('https://api.paystack.co/transaction/initialize', {
+      email: email,
+      amount: amountSmallest,
+      metadata: { name, phone: normalizedPhone, ref: ref || null },
+      currency: 'GHS'
+    }, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' }
+    });
+
+    const data = initResp.data;
+    if (!data || !data.data) return res.status(500).json({ error: 'Paystack initialize failed' });
 
     return res.json({
-      authorization_url: response.data.data.authorization_url,
-      reference: response.data.data.reference
+      authorization_url: data.data.authorization_url,
+      reference: data.data.reference,
+      amount: amountGHS
     });
 
   } catch (err) {
-    console.error("create-payment error:", err.response?.data || err.message);
-    res.status(500).json({ error: "Payment creation failed" });
+    console.error('create-payment error', err.response ? err.response.data : err.message);
+    return res.status(500).json({ error: 'server error' });
   }
 });
 
-// ======================================================
-// ====================== WEBHOOK =======================
-// ======================================================
-app.post("/webhook", async (req, res) => {
+// ======= WEBHOOK =======
+app.post('/webhook', async (req, res) => {
   try {
-    const signature = req.headers["x-paystack-signature"];
-    if (!verifySignature(req.rawBody, signature)) {
-      return res.status(400).send("Invalid signature");
+    const signature = req.headers['x-paystack-signature'] || req.headers['X-Paystack-Signature'];
+    const raw = req.rawBody || JSON.stringify(req.body);
+
+    if (!verifyPaystackSignature(raw, signature)) {
+      console.warn('Invalid Paystack signature');
+      return res.status(400).send('Invalid signature');
     }
 
     const event = req.body;
-    if (event.event !== "charge.success") {
-      return res.status(200).send("ignored");
+    const data = event.data || {};
+    const status = (data.status || '').toLowerCase();
+    if (status !== 'success') {
+      console.log('ignored non-successful transaction');
+      return res.status(200).send('ignored');
     }
 
-    const data = event.data;
-    const md = data.metadata || {};
+    const metadata = data.metadata || {};
+    let phone = metadata.phone || '';
+    let email = metadata.email || '';
+    const refCode = metadata.ref || null;
 
-    let phone = md.phone;
-    let email = md.email;
-    let refCode = md.refCode;
+    if (phone && phone.startsWith('0')) phone = '233' + phone.slice(1);
+    if (phone && phone.startsWith('+')) phone = phone.slice(1);
 
-    // Reformat phone
-    if (phone.startsWith("0")) phone = "233" + phone.slice(1);
-    if (phone.startsWith("+")) phone = phone.slice(1);
-
-    // Get voucher
+    // get voucher
     const voucher = await getAndMarkVoucher(phone, email, refCode);
     if (!voucher) {
-      return res.status(200).send("no vouchers");
+      console.error('No vouchers left');
+      // optionally inform admin here
+      return res.status(200).send('no vouchers');
     }
 
-    // SMS content
-    const msg = `Your WASSCE Voucher:\nSerial: ${voucher.serial}\nPIN: ${voucher.pin}\nThank you for buying from Authentic Checkers.`;
+    const message = `Your WASSCE voucher:\nSerial: ${voucher.serial}\nPIN: ${voucher.pin}\nThank you for buying from Authentic Checkers!`;
 
+    // send SMS
     try {
-      await sendSMS(phone, msg);
+      const smsResp = await sendArkeselSMS(phone, message);
+      console.log('SMS sent', smsResp);
     } catch (e) {
-      console.error("SMS error:", e.response?.data || e.message);
+      console.error('Arkesel send error', e.response ? e.response.data : e.message);
     }
 
-    res.status(200).send("ok");
+    // affiliate logging
+    try {
+      if (refCode) {
+        await recordAffiliateSale(refCode, phone, voucher.serial);
+        console.log('Affiliate recorded:', refCode);
+      }
+    } catch (e) {
+      console.error('Affiliate logging error', e.message || e);
+    }
+
+    // Optionally append a payments log row (Payments tab) - safe basic logging
+    try {
+      const sheets = getSheetsClient();
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SHEET_ID,
+        range: 'Payments!A:G',
+        valueInputOption: 'RAW',
+        requestBody: {
+          values: [[new Date().toISOString(), data.reference || '', phone, email, 25, voucher.serial, refCode || '']]
+        }
+      });
+    } catch (e) {
+      console.error('Payment log append error', e.message || e);
+    }
+
+    return res.status(200).send('ok');
 
   } catch (err) {
-    console.error("Webhook error:", err);
-    res.status(500).send("server error");
+    console.error('webhook error', err);
+    return res.status(500).send('server error');
   }
 });
 
-// ======================================================
+app.get('/', (req, res) => res.send('Voucher server running ✔'));
 
-app.get("/", (req, res) => res.send("Voucher server running ✔"));
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
