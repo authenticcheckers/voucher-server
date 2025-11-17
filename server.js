@@ -1,4 +1,5 @@
 // server.js
+// Full: create-payment, webhook, voucher assignment, Arkesel SMS, affiliate logging
 
 const express = require('express');
 const cors = require("cors");
@@ -9,14 +10,19 @@ const { google } = require('googleapis');
 
 const app = express();
 
-// ========= ENABLE CORS (AFTER app is created!) =========
+// Allow browser calls from your GitHub Pages + Google Sites
 app.use(cors({
-  origin: "https://authenticcheckers.github.io",
+  origin: [
+    "https://authenticcheckers.github.io",
+    "https://sites.google.com",
+    "https://sites.google.com/view/wasscevouchershop",
+    "https://sites.google.com/view/wasscevouchershop/home"
+  ],
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
-// ========= RAW BODY FOR PAYSTACK SIGNATURE =========
+// capture raw body for webhook verification
 app.use(bodyParser.json({
   verify: (req, res, buf) => { req.rawBody = buf.toString(); }
 }));
@@ -30,7 +36,6 @@ const ARKESEL_SENDER = process.env.ARKESEL_SENDER || '';
 const SHEET_ID = process.env.SHEET_ID || '';
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || '';
-
 
 if (!PAYSTACK_SECRET_KEY) {
   console.error("Missing Paystack key.");
@@ -77,7 +82,6 @@ async function getAndMarkVoucher(phone, email) {
     const status = (row[2] || "").toLowerCase().trim();
 
     if (status !== "used" && status !== "yes") {
-
       const serial = (row[0] || "").trim();
       const pin = (row[1] || "").trim();
 
@@ -124,15 +128,82 @@ function verifySignature(rawBody, signature) {
   return computed === signature;
 }
 
+// ========== AFFILIATE: recordAffiliateSale ==========
+// Appends a row to AffiliateSales and updates Affiliates totals.
+// AffiliateSales columns: Date | AffiliateCode | BuyerPhone | Amount | Commission
+// Affiliates columns: AffiliateCode | Name | Phone | TotalSales | TotalCommission
+const COMMISSION_GHS = 3; // fixed commission per voucher
+async function recordAffiliateSale(refCode, buyerPhone, amountGHS) {
+  if (!refCode) return;
+
+  const sheets = getSheetsClient();
+  const date = new Date().toISOString();
+  const commission = COMMISSION_GHS;
+
+  // 1) Append to AffiliateSales
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: "AffiliateSales!A:E",
+    valueInputOption: "RAW",
+    requestBody: {
+      values: [[date, refCode, buyerPhone, amountGHS, commission]]
+    }
+  });
+
+  // 2) Update Affiliates sheet totals (find row with AffiliateCode)
+  const affRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: "Affiliates!A2:E"
+  });
+  const affRows = affRes.data.values || [];
+
+  let foundIndex = -1;
+  for (let i = 0; i < affRows.length; i++) {
+    if ((affRows[i][0] || "").toString() === refCode) {
+      foundIndex = i;
+      break;
+    }
+  }
+
+  if (foundIndex === -1) {
+    // create new affiliate row
+    const totalSales = amountGHS;
+    const totalCommission = commission;
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: "Affiliates!A:E",
+      valueInputOption: "RAW",
+      requestBody: {
+        values: [[refCode, "", "", totalSales, totalCommission]]
+      }
+    });
+  } else {
+    // update existing totals
+    const rowNum = foundIndex + 2; // offset
+    const existing = affRows[foundIndex];
+    const prevSales = parseFloat(existing[3] || 0) || 0;
+    const prevComm = parseFloat(existing[4] || 0) || 0;
+    const newSales = prevSales + amountGHS;
+    const newComm = prevComm + commission;
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `Affiliates!D${rowNum}:E${rowNum}`,
+      valueInputOption: "RAW",
+      requestBody: {
+        values: [[newSales, newComm]]
+      }
+    });
+  }
+}
+
 // =========================================================
 // =============== CREATE PAYMENT ROUTE ====================
 // =========================================================
 app.post('/create-payment', async (req, res) => {
   try {
-    const { name, phone, email } = req.body;
+    const { name, phone, email, ref } = req.body;
 
-    if (!name || !phone)
-      return res.status(400).json({ error: "name and phone required" });
+    if (!name || !phone) return res.status(400).json({ error: "name and phone required" });
 
     // Normalize phone: 054... → 23354...
     let fixedPhone = phone.trim();
@@ -140,7 +211,7 @@ app.post('/create-payment', async (req, res) => {
     if (fixedPhone.startsWith("+")) fixedPhone = fixedPhone.slice(1);
 
     const amountGHS = 25.00;
-    const amountPesewas = amountGHS * 100;
+    const amountPesewas = Math.round(amountGHS * 100);
 
     const response = await axios.post(
       "https://api.paystack.co/transaction/initialize",
@@ -148,7 +219,7 @@ app.post('/create-payment', async (req, res) => {
         email: email || `${fixedPhone}@noemail.local`,
         amount: amountPesewas,
         currency: "GHS",
-        metadata: { name, phone: fixedPhone, email }
+        metadata: { name, phone: fixedPhone, ref: ref || null }
       },
       {
         headers: {
@@ -185,8 +256,7 @@ app.post("/webhook", async (req, res) => {
 
     const event = req.body;
 
-    if (event.event !== "charge.success")
-      return res.status(200).send("ignored");
+    if (event.event !== "charge.success") return res.status(200).send("ignored");
 
     const data = event.data;
     const metadata = data.metadata || {};
@@ -194,8 +264,8 @@ app.post("/webhook", async (req, res) => {
     let phone = metadata.phone || "";
     let email = metadata.email || "";
 
-    if (phone.startsWith("0")) phone = "233" + phone.slice(1);
-    if (phone.startsWith("+")) phone = phone.slice(1);
+    if (phone && phone.startsWith("0")) phone = "233" + phone.slice(1);
+    if (phone && phone.startsWith("+")) phone = phone.slice(1);
 
     // ===== get voucher =====
     const voucher = await getAndMarkVoucher(phone, email);
@@ -215,6 +285,17 @@ app.post("/webhook", async (req, res) => {
       console.error("SMS error:", e.response?.data || e.message);
     }
 
+    // ===== affiliate logging =====
+    try {
+      const refCode = metadata.ref || null;
+      if (refCode) {
+        await recordAffiliateSale(refCode, phone, 25.00);
+        console.log("Affiliate recorded:", refCode);
+      }
+    } catch (e) {
+      console.error("Affiliate logging error:", e.message || e);
+    }
+
     return res.status(200).send("ok");
 
   } catch (err) {
@@ -224,7 +305,6 @@ app.post("/webhook", async (req, res) => {
 });
 
 // =========================================================
-
 app.get("/", (req, res) => res.send("Voucher server running ✔"));
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
