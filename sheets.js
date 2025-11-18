@@ -12,27 +12,20 @@ if (!SHEET_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) {
 }
 
 const auth = new google.auth.GoogleAuth({
-  credentials: {
-    client_email: GOOGLE_CLIENT_EMAIL,
-    private_key: GOOGLE_PRIVATE_KEY,
-    type: "service_account"
-  },
+  credentials: { client_email: GOOGLE_CLIENT_EMAIL, private_key: GOOGLE_PRIVATE_KEY, type: 'service_account' },
   scopes: ['https://www.googleapis.com/auth/spreadsheets']
 });
 
 const sheetsApi = google.sheets({ version: 'v4', auth });
 
-/**
- * getAndMarkVoucher(phone, email, affiliateCode)
- * Reads Main voucher sheet!A2:G, finds first row where used != yes, marks USED and writes buyer details.
- */
-async function getAndMarkVoucher(phone, email, affiliateCode) {
-  const resp = await sheetsApi.spreadsheets.values.get({
+// getAndMarkVoucher: READ Main voucher sheet!A2:F and write back A..F
+async function getAndMarkVoucher(phone, email) {
+  const res = await sheetsApi.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: 'Main voucher sheet!A2:G'
+    range: 'Main voucher sheet!A2:F'
   });
 
-  const rows = resp.data.values || [];
+  const rows = res.data.values || [];
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const used = (row[2] || '').toString().trim().toLowerCase();
@@ -41,59 +34,60 @@ async function getAndMarkVoucher(phone, email, affiliateCode) {
       const pin = (row[1] || '').toString().trim();
       const rowNum = i + 2;
       const now = new Date().toISOString();
+
+      // Update A..F: serial, pin, USED, Phone, Email, Date
       await sheetsApi.spreadsheets.values.update({
         spreadsheetId: SHEET_ID,
-        range: `Main voucher sheet!A${rowNum}:G${rowNum}`,
+        range: `Main voucher sheet!A${rowNum}:F${rowNum}`,
         valueInputOption: 'RAW',
         requestBody: {
-          values: [[serial, pin, 'USED', phone || '', email || '', now, affiliateCode || '']]
+          values: [[serial, pin, 'USED', phone || '', email || '', now]]
         }
       });
+
       return { serial, pin };
     }
   }
   return null;
 }
 
-/**
- * appendAffiliateSaleRow(refCode, buyerPhone, voucherSerial)
- * Appends to AffiliateSales!A:G
- */
+// appendAffiliateSaleRow: AffiliateSales!A:G
 async function appendAffiliateSaleRow(refCode, buyerPhone, voucherSerial) {
+  const now = new Date().toISOString();
   await sheetsApi.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
     range: 'AffiliateSales!A:G',
     valueInputOption: 'RAW',
     requestBody: {
-      values: [[new Date().toISOString(), refCode || '', buyerPhone || '', 25, 3, voucherSerial || '', 'no']]
+      values: [[now, refCode || '', buyerPhone || '', 25, 3, voucherSerial || '', 'no']]
     }
   });
 }
 
-/**
- * updateOrCreateAffiliateTotals(refCode)
- * Reads Affiliates!A2:E and updates totals or appends new row
- */
+// updateOrCreateAffiliateTotals: Affiliates!A2:E
 async function updateOrCreateAffiliateTotals(refCode) {
   if (!refCode) return;
-  const resp = await sheetsApi.spreadsheets.values.get({
+  const res = await sheetsApi.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
     range: 'Affiliates!A2:E'
   });
-  const rows = resp.data.values || [];
+  const rows = res.data.values || [];
   let found = -1;
   for (let i = 0; i < rows.length; i++) {
     if ((rows[i][0] || '').toString() === refCode) { found = i; break; }
   }
   if (found === -1) {
+    // append new affiliate: AffiliateCode, Name(empty), Phone(empty), TotalSales=1, TotalCommission=3
     await sheetsApi.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: 'Affiliates!A:E',
       valueInputOption: 'RAW',
-      requestBody: { values: [[refCode, '', '', 1, 3]] }
+      requestBody: {
+        values: [[refCode, '', '', 1, 3]]
+      }
     });
   } else {
-    const rowIndex = found + 2;
+    const rowNum = found + 2;
     const existing = rows[found];
     const prevSales = parseFloat(existing[3] || 0) || 0;
     const prevComm = parseFloat(existing[4] || 0) || 0;
@@ -101,17 +95,14 @@ async function updateOrCreateAffiliateTotals(refCode) {
     const newComm = prevComm + 3;
     await sheetsApi.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
-      range: `Affiliates!D${rowIndex}:E${rowIndex}`,
+      range: `Affiliates!D${rowNum}:E${rowNum}`,
       valueInputOption: 'RAW',
       requestBody: { values: [[newSales, newComm]] }
     });
   }
 }
 
-/**
- * appendPaymentLog(reference, phone, email, amount, voucherSerial, affiliateCode)
- * Appends to Payments!A:G (optional)
- */
+// appendPaymentLog: Payments!A:G (optional)
 async function appendPaymentLog(reference, phone, email, amount, voucherSerial, affiliateCode) {
   try {
     await sheetsApi.spreadsheets.values.append({
@@ -123,27 +114,24 @@ async function appendPaymentLog(reference, phone, email, amount, voucherSerial, 
       }
     });
   } catch (err) {
-    console.warn('appendPaymentLog: Payments tab missing or append failed:', err.message || err);
+    console.warn('appendPaymentLog failed (optional Payments tab missing):', err.message || err);
   }
 }
 
-/**
- * paymentsContainsReference(reference)
- * Checks Payments!B2:B for given reference. Returns true/false.
- */
+// paymentsContainsReference: check Payments!B2:B for idempotency
 async function paymentsContainsReference(reference) {
   try {
-    const resp = await sheetsApi.spreadsheets.values.get({
+    const res = await sheetsApi.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
       range: 'Payments!B2:B'
     });
-    const rows = resp.data.values || [];
+    const rows = res.data.values || [];
     for (const r of rows) {
       if ((r[0] || '') === reference) return true;
     }
     return false;
   } catch (err) {
-    // If Payments tab doesn't exist, return false so processing continues
+    // If Payments tab missing, continue and return false
     console.warn('paymentsContainsReference read failed (continuing):', err.message || err);
     return false;
   }
