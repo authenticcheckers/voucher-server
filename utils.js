@@ -1,11 +1,5 @@
 // utils.js
 
-function generateVoucherCode() {
-  const s = Math.random().toString(36).slice(2, 10).toUpperCase();
-  const n = Math.floor(1000 + Math.random() * 9000);
-  return `${s}-${n}`;
-}
-
 function normalizePhone(phone) {
   if (!phone) return '';
   let p = phone.toString().trim();
@@ -15,4 +9,11 @@ function normalizePhone(phone) {
   return p;
 }
 
-module.exports = { generateVoucherCode, normalizePhone };
+// voucher generator (not used by current flow but included)
+function generateVoucher() {
+  const a = Math.random().toString(36).substring(2, 8).toUpperCase();
+  const b = Math.floor(100000 + Math.random() * 900000);
+  return `${a}-${b}`;
+}
+
+module.exports = { normalizePhone, generateVoucher };
