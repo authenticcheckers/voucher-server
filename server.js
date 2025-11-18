@@ -1,14 +1,17 @@
 // server.js
-// Authentic Checkers backend - Paystack + Arkesel + Google Sheets (exact sheet structure)
-// Required env vars (see below). Paste this file into your repo and deploy on Render.
+// Backend for Authentic Vouchers (Paystack + Arkesel + Google Sheets)
+// Matches your current sheets where Main voucher sheet has 6 columns (no AffiliateCode)
 
 const express = require('express');
-const cors = require('cors');
 const bodyParser = require('body-parser');
+const cors = require('cors');
 const crypto = require('crypto');
 const axios = require('axios');
-const { google } = require('googleapis');
 require('dotenv').config();
+
+const sheets = require('./sheets');
+const arkesel = require('./arkesel');
+const utils = require('./utils');
 
 const app = express();
 
@@ -17,7 +20,7 @@ app.use(bodyParser.json({
   verify: (req, res, buf) => { req.rawBody = buf.toString(); }
 }));
 
-// CORS - allow your frontend origins
+// CORS - add any extra origin your frontend uses
 app.use(cors({
   origin: [
     "https://authenticcheckers.github.io",
@@ -29,17 +32,9 @@ app.use(cors({
   allowedHeaders: ["Content-Type","Authorization"]
 }));
 
-// ========== CONFIG ==========
 const PORT = process.env.PORT || 3000;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || '';
 const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET_KEY;
-const ARKESEL_API_KEY = process.env.ARKESEL_API_KEY || '';
-const ARKESEL_SENDER = process.env.ARKESEL_SENDER || '';
-const SHEET_ID = process.env.SHEET_ID || '';
-const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';
-let GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || '';
-
-// constants
 const VOUCHER_PRICE_GHS = 25;
 const COMMISSION_GHS = 3;
 
@@ -47,207 +42,38 @@ if (!PAYSTACK_SECRET_KEY) {
   console.error('Missing PAYSTACK_SECRET_KEY. Exiting.');
   process.exit(1);
 }
-if (!SHEET_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) {
-  console.error('Missing Google Sheets config (SHEET_ID / GOOGLE_CLIENT_EMAIL / GOOGLE_PRIVATE_KEY). Exiting.');
+if (!process.env.SHEET_ID || !process.env.GOOGLE_CLIENT_EMAIL || !process.env.GOOGLE_PRIVATE_KEY) {
+  console.error('Missing Google Sheets credentials (SHEET_ID / GOOGLE_CLIENT_EMAIL / GOOGLE_PRIVATE_KEY). Exiting.');
   process.exit(1);
 }
-if (!ARKESEL_API_KEY) {
-  console.warn('Warning: ARKESEL_API_KEY not set — SMS will fail until provided.');
+if (!process.env.ARKESEL_API_KEY) {
+  console.warn('ARKESEL_API_KEY not set — SMS will fail until provided.');
 }
 
-// fix private key newlines if stored with \n sequences
-GOOGLE_PRIVATE_KEY = GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
-
-// ========== Google Sheets helper ==========
-function getSheetsClient() {
-  const credentials = {
-    type: "service_account",
-    client_email: GOOGLE_CLIENT_EMAIL,
-    private_key: GOOGLE_PRIVATE_KEY
-  };
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets']
-  });
-  return google.sheets({ version: 'v4', auth });
-}
-
-// ========== Utility functions ==========
-
-/** Normalize Ghana phone to no '+' and international 233 format if user provided local 0xxxxx */
-function normalizePhone(phone) {
-  if (!phone) return '';
-  let p = phone.toString().trim();
-  p = p.replace(/\s+/g, '');
-  if (p.startsWith('+')) p = p.slice(1);
-  if (p.startsWith('0')) p = '233' + p.slice(1);
-  return p;
-}
-
-/** Check Payments tab for existing paystack reference (idempotency) */
-async function paymentsContainsReference(reference) {
-  try {
-    const sheets = getSheetsClient();
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: 'Payments!B2:B' // PaystackReference column (B)
-    });
-    const rows = res.data.values || [];
-    for (const r of rows) {
-      if ((r[0] || '') === reference) return true;
-    }
-    return false;
-  } catch (err) {
-    // If Payments tab missing or read fails, return false so processing continues.
-    console.warn('paymentsContainsReference read error (continuing):', err.message || err);
-    return false;
-  }
-}
-
-// ========== Voucher operations ==========
-
-/**
- * Pick the first unused voucher from Main voucher sheet and mark USED.
- * Returns { serial, pin } or null if none.
- */
-async function getAndMarkVoucher(phone, email, affiliateCode) {
-  const sheets = getSheetsClient();
-  const read = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: 'Main voucher sheet!A2:G'
-  });
-  const rows = read.data.values || [];
-
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const used = (row[2] || '').toString().trim().toLowerCase();
-    if (used !== 'yes' && used !== 'used') {
-      const serial = (row[0] || '').toString().trim();
-      const pin = (row[1] || '').toString().trim();
-      const rowNumber = i + 2;
-      const now = new Date().toISOString();
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID,
-        range: `Main voucher sheet!A${rowNumber}:G${rowNumber}`,
-        valueInputOption: 'RAW',
-        requestBody: {
-          values: [[serial, pin, 'USED', phone || '', email || '', now, affiliateCode || '']]
-        }
-      });
-      return { serial, pin };
-    }
-  }
-  return null;
-}
-
-// ========== Affiliate logging ==========
-
-async function appendAffiliateSale(affiliateCode, buyerPhone, voucherSerial) {
-  const sheets = getSheetsClient();
-  const now = new Date().toISOString();
-  const amount = VOUCHER_PRICE_GHS;
-  const commission = COMMISSION_GHS;
-  // Date | AffiliateCode | BuyerPhone | Amount | Commission | VoucherSerial | PaidStatus
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range: 'AffiliateSales!A:G',
-    valueInputOption: 'RAW',
-    requestBody: {
-      values: [[now, affiliateCode || '', buyerPhone || '', amount, commission, voucherSerial || '', 'no']]
-    }
-  });
-}
-
-async function incrementAffiliateTotals(affiliateCode) {
-  if (!affiliateCode) return;
-  const sheets = getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: 'Affiliates!A2:E'
-  });
-  const rows = res.data.values || [];
-  let found = -1;
-  for (let i = 0; i < rows.length; i++) {
-    if ((rows[i][0] || '').toString() === affiliateCode) { found = i; break; }
-  }
-  if (found === -1) {
-    // append: AffiliateCode | Name(empty) | Phone(empty) | TotalSales=1 | TotalCommission=COMMISSION_GHS
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: 'Affiliates!A:E',
-      valueInputOption: 'RAW',
-      requestBody: { values: [[affiliateCode, '', '', 1, COMMISSION_GHS]] }
-    });
-  } else {
-    const idx = found + 2;
-    const existing = rows[found];
-    const prevSales = parseFloat(existing[3] || 0) || 0;
-    const prevComm = parseFloat(existing[4] || 0) || 0;
-    const newSales = prevSales + 1;
-    const newComm = prevComm + COMMISSION_GHS;
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
-      range: `Affiliates!D${idx}:E${idx}`,
-      valueInputOption: 'RAW',
-      requestBody: { values: [[newSales, newComm]] }
-    });
-  }
-}
-
-// ========== Payments log (optional) ==========
-
-async function appendPaymentLog(reference, phone, email, amount, voucherSerial, affiliateCode) {
-  const sheets = getSheetsClient();
-  try {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: 'Payments!A:G',
-      valueInputOption: 'RAW',
-      requestBody: {
-        values: [[new Date().toISOString(), reference || '', phone || '', email || '', amount || '', voucherSerial || '', affiliateCode || '']]
-      }
-    });
-  } catch (err) {
-    // optional Payments tab; non-fatal
-    console.warn('appendPaymentLog failed (optional):', err.message || err);
-  }
-}
-
-// ========== Arkesel SMS ==========
-async function sendArkeselSMS(phone, message) {
-  if (!ARKESEL_API_KEY) throw new Error('ARKESEL_API_KEY not configured');
-  const url = 'https://sms.arkesel.com/api/v2/sms/send';
-  const payload = { recipients: [phone], message };
-  if (ARKESEL_SENDER) payload.sender = ARKESEL_SENDER;
-  const headers = { 'Content-Type': 'application/json', 'api-key': ARKESEL_API_KEY };
-  const resp = await axios.post(url, payload, { headers });
-  return resp.data;
-}
-
-// ========== Paystack signature verify ==========
+// Utility: verify Paystack signature
 function verifyPaystackSignature(rawBody, signature) {
   if (!PAYSTACK_WEBHOOK_SECRET) return false;
-  const computed = crypto.createHmac('sha512', PAYSTACK_WEBHOOK_SECRET).update(rawBody).digest('hex');
-  return computed === signature;
+  const hash = crypto.createHmac('sha512', PAYSTACK_WEBHOOK_SECRET).update(rawBody).digest('hex');
+  return hash === signature;
 }
-
-// -------------------- ROUTES --------------------
 
 /**
  * POST /create-payment
  * Body: { name, phone, email, ref }
- * Returns: { authorization_url, reference, amount }
+ * Returns authorization_url + reference
  */
 app.post('/create-payment', async (req, res) => {
   try {
     const { name, phone, email, ref } = req.body || {};
+
     if (!name || !phone || !email) {
       return res.status(400).json({ error: 'name, phone and email required' });
     }
-    const normalizedPhone = normalizePhone(phone);
+
+    const normalizedPhone = utils.normalizePhone(phone);
     const amountPesewas = Math.round(VOUCHER_PRICE_GHS * 100);
 
-    const resp = await axios.post('https://api.paystack.co/transaction/initialize', {
+    const initResp = await axios.post('https://api.paystack.co/transaction/initialize', {
       email,
       amount: amountPesewas,
       currency: 'GHS',
@@ -256,17 +82,19 @@ app.post('/create-payment', async (req, res) => {
       headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' }
     });
 
-    if (!resp.data || !resp.data.data) {
+    if (!initResp.data || !initResp.data.data) {
+      console.error('Paystack initialize returned unexpected response', initResp.data);
       return res.status(500).json({ error: 'Paystack initialize failed' });
     }
 
     return res.json({
-      authorization_url: resp.data.data.authorization_url,
-      reference: resp.data.data.reference,
+      authorization_url: initResp.data.data.authorization_url,
+      reference: initResp.data.data.reference,
       amount: VOUCHER_PRICE_GHS
     });
+
   } catch (err) {
-    console.error('create-payment error:', err.response?.data || err.message);
+    console.error('create-payment error', err.response?.data || err.message || err);
     const body = err.response?.data || { error: 'server error' };
     return res.status(500).json(body);
   }
@@ -274,7 +102,7 @@ app.post('/create-payment', async (req, res) => {
 
 /**
  * POST /webhook
- * Paystack will POST here with x-paystack-signature header
+ * Paystack posts here on charge.success
  */
 app.post('/webhook', async (req, res) => {
   try {
@@ -292,9 +120,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     const data = event.data || {};
-    if ((data.status || '').toLowerCase() !== 'success') {
-      return res.status(200).send('ignored');
-    }
+    if ((data.status || '').toLowerCase() !== 'success') return res.status(200).send('ignored');
 
     const metadata = data.metadata || {};
     let phone = metadata.phone || '';
@@ -302,57 +128,57 @@ app.post('/webhook', async (req, res) => {
     const refCode = metadata.ref || null;
     const paystackRef = data.reference || '';
 
-    // Idempotency: check if this reference was already processed via Payments sheet
-    const already = await paymentsContainsReference(paystackRef);
+    // Idempotency: check Payments tab for existing reference
+    const already = await sheets.paymentsContainsReference(paystackRef);
     if (already) {
       console.log('Webhook duplicate ignored for reference:', paystackRef);
       return res.status(200).send('already processed');
     }
 
-    // Normalize phone
+    // Normalize phone for SMS
     if (phone && phone.startsWith('0')) phone = '233' + phone.slice(1);
     if (phone && phone.startsWith('+')) phone = phone.slice(1);
 
-    // Pick a voucher and mark it used
-    const voucher = await getAndMarkVoucher(phone, email, refCode);
+    // Get and mark a voucher (note: voucher sheet has no AffiliateCode column)
+    const voucher = await sheets.getAndMarkVoucher(phone, email);
     if (!voucher) {
       console.error('No vouchers left');
-      // append a payment log anyway
-      await appendPaymentLog(paystackRef, phone, email, VOUCHER_PRICE_GHS, '', refCode || '');
+      // Append payment log for record even if no voucher
+      await sheets.appendPaymentLog(paystackRef, phone, email, VOUCHER_PRICE_GHS, '', refCode || '');
       return res.status(200).send('no vouchers');
     }
 
-    // Send SMS
+    // Send SMS by Arkesel
     const message = `Your WASSCE voucher:\nSerial: ${voucher.serial}\nPIN: ${voucher.pin}\nThank you for buying from Authentic Checkers!`;
     try {
-      await sendArkeselSMS(phone, message);
+      await arkesel.sendSMS(phone, message);
       console.log('SMS sent to', phone);
     } catch (err) {
-      console.error('Arkesel send error:', err.response?.data || err.message);
+      console.error('Arkesel send error', err.response?.data || err.message || err);
     }
 
-    // Affiliate: append sale and increment totals
-    try {
-      if (refCode) {
-        await appendAffiliateSale(refCode, phone, voucher.serial);
-        await incrementAffiliateTotals(refCode);
-        console.log('Affiliate recorded for', refCode);
+    // Affiliate logging (only in Affiliates & AffiliateSales tabs)
+    if (refCode) {
+      try {
+        await sheets.appendAffiliateSaleRow(refCode, phone, voucher.serial);
+        await sheets.updateOrCreateAffiliateTotals(refCode);
+        console.log('Affiliate sale recorded for', refCode);
+      } catch (err) {
+        console.error('Affiliate logging error', err.message || err);
       }
-    } catch (err) {
-      console.error('Affiliate logging error:', err.message || err);
     }
 
-    // Append payment log to Payments (optional)
+    // append to payments log (optional)
     try {
-      await appendPaymentLog(paystackRef, phone, email, VOUCHER_PRICE_GHS, voucher.serial, refCode || '');
+      await sheets.appendPaymentLog(paystackRef, phone, email, VOUCHER_PRICE_GHS, voucher.serial, refCode || '');
     } catch (err) {
-      console.warn('Payment log append error:', err.message || err);
+      console.warn('Payment log append error (non-fatal):', err.message || err);
     }
 
     return res.status(200).send('ok');
 
   } catch (err) {
-    console.error('webhook error:', err);
+    console.error('webhook error', err);
     return res.status(500).send('server error');
   }
 });
@@ -360,5 +186,4 @@ app.post('/webhook', async (req, res) => {
 // Health
 app.get('/', (req, res) => res.send('Voucher server running ✔'));
 
-// Start server
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
